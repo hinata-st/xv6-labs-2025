@@ -271,6 +271,7 @@ kfork(void)
     release(&np->lock);
     return -1;
   }
+  // 把父进程的用户内存大小复制给子进程
   np->sz = p->sz;
 
   // copy saved user registers.
@@ -278,6 +279,9 @@ kfork(void)
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
+
+  // copy the mask from the parent to the child process.
+  np->interpose_mask = p->interpose_mask;
 
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)
