@@ -135,11 +135,22 @@ syscall(void)
 {
   int num;
   struct proc *p = myproc();
-
+  uint8 a = 0;
   num = p->trapframe->a7;
 
+  if (num == SYS_open || num == SYS_exec){
+    char argpath[MAXPATH];
+    if (argstr(0, argpath, MAXPATH) >= 0)
+    {
+      if (strncmp(argpath, p->path, MAXPATH) == 0)
+      {
+        a = 1;
+      }
+    }
+  }
+
   // Check if the interpose mask has the bit set for this syscall number.
-  if (p->interpose_mask & (1 << num)) {
+  if ((p->interpose_mask & (1 << num)) && a == 0) {
     // If the interpose mask has the bit set for this syscall number,
     // we will interpose and return -1 without calling the actual syscall.
     p->trapframe->a0 = -1;

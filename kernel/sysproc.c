@@ -13,6 +13,8 @@ sys_interpose(void)
   uint64 mask;
   argaddr(0, &mask);
   struct proc *p = myproc();
+  if (argstr(1, p->path, MAXPATH) < 0)
+    return -1;
   p->interpose_mask = mask;
   return 0;
 }

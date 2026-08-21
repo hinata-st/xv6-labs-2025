@@ -107,4 +107,5 @@ struct proc {
 
   // For interpose
   uint64 interpose_mask;
+  char path[MAXPATH]; // Path to the interpose library
 };
