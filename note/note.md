@@ -1136,3 +1136,513 @@ num = p->trapframe->a7;
 ```
 
 ## Sandbox a command(moderate)
+
+### 1. 实验目标
+
+Sandbox 的目标不是限制用户程序可以访问的内核函数，而是限制它能发起哪些系统调用。
+
+`interpose` 接收两个参数：
+
+```C
+int interpose(int mask, char *path);
+```
+
+其中 `mask` 的每一个 bit 对应一个系统调用号。若 `mask` 的第 `n` 位为 1，则当前进程调用系统调用号为 `n` 的系统调用时，内核应当拒绝该调用，并让用户态得到返回值 `-1`。
+
+例如：
+
+```text
+SYS_open = 15
+1 << SYS_open = 1 << 15 = 32768
+```
+
+因此：
+
+```Shell
+sandbox 32768 - cat README
+```
+
+会让 `cat` 进程中的 `open` 系统调用被拒绝，所以输出为：
+
+```text
+cat: cannot open README
+```
+
+这里的限制属于进程自身状态，因此必须保存在 `struct proc` 中。用户程序调用 `interpose` 后，限制会在它后续的每一个系统调用入口生效。
+
+### 2. 把 `sandbox` 加入构建系统
+
+`sandbox` 是用户态程序，只有加入 `UPROGS` 后才会被编译并写入 `fs.img`：
+
+```Makefile
+UPROGS=\
+	...
+	$U/_sandbox\
+```
+
+`$U` 展开为 `user`，所以最终构建目标是 `user/_sandbox`。
+
+如果没有这一步，源码即使存在，也不会出现在 xv6 文件系统中，shell 中也无法执行：
+
+```Shell
+sandbox ...
+```
+
+### 3. 增加系统调用编号
+
+在 `kernel/syscall.h` 中增加新的系统调用号：
+
+```C
+#define SYS_interpose 22
+```
+
+这个编号是用户态和内核态之间的协议值。用户态的 `interpose` 汇编桩会把 `22` 写入 `a7`，内核再用同一个编号索引系统调用处理函数。
+
+编号必须保持唯一，并且用户态、内核态使用同一个头文件，避免两边定义不一致。
+
+### 4. 增加用户态接口和汇编桩
+
+在 `user/user.h` 中声明：
+
+```C
+int interpose(int, char*);
+```
+
+这个声明让 `user/sandbox.c` 可以通过普通的 C 函数调用语法使用 `interpose`。
+
+在 `user/usys.pl` 中增加：
+
+```Perl
+entry("interpose");
+```
+
+构建时 `user/usys.pl` 会生成 `user/usys.S`，其中的桩代码等价于：
+
+```asm
+interpose:
+        li a7, SYS_interpose
+        ecall
+        ret
+```
+
+这说明用户态并不直接调用 `sys_interpose`。它只负责准备参数，把系统调用号放入 `a7`，然后执行 `ecall` 进入内核。
+
+`ecall` 时参数按 RISC-V 调用约定位于寄存器中：
+
+```text
+a0 = mask
+a1 = path 的用户虚拟地址
+a7 = SYS_interpose
+```
+
+### 5. 用户态 `sandbox` 程序如何组织参数
+
+`user/sandbox.c` 接收以下形式的命令：
+
+```text
+sandbox <mask> <path> <command> [args...]
+```
+
+程序中的关键步骤是：
+
+1. 检查参数个数是否至少为 4；
+2. 检查 `argv[1]` 的第一个字符是否为数字；
+3. 从 `argv[3]` 开始构造真正要执行命令的参数数组；
+4. 使用 `argv[1]` 作为掩码；
+5. 使用 `argv[2]` 作为被允许的路径；
+6. 执行 `fork()`；
+7. 子进程先调用 `interpose()`，再调用 `exec()`；
+8. 父进程调用 `wait()`，等待子进程结束。
+
+命令参数构造的核心代码是：
+
+```C
+int n = 2;
+int mask = 1;
+
+n += 1; // 跳过 path
+
+for(i = n; i < argc && i < MAXARG; i++){
+  nargv[i-n] = argv[i];
+}
+nargv[argc-n] = 0;
+```
+
+这里 `n` 不是掩码，而是“从原始 `argv` 中跳过多少个程序名参数”的计数。开始时它指向 `argv[2]`，即路径参数；执行 `n += 1` 后指向 `argv[3]`，即被沙箱执行的命令。
+
+结尾的 `nargv[argc-n] = 0` 为 `exec()` 所需参数数组写入空指针终止符。
+
+选择先 `fork()` 再调用 `interpose()`，是为了不让 shell 本身也受到限制。限制只施加在子进程中：
+
+```C
+if(pid == 0) {
+  if (interpose(atoi(argv[mask]), argv[mask+1]) < 0) {
+    printf("%s: interpose failed", argv[0]);
+    exit(1);
+  }
+  exec(nargv[0], nargv);
+}
+```
+
+### 6. 在进程结构中保存沙箱状态
+
+在 `kernel/proc.h` 的 `struct proc` 中增加：
+
+```C
+// For interpose
+uint64 interpose_mask;
+char path[MAXPATH];
+```
+
+`interpose_mask` 保存需要拒绝的系统调用集合。
+
+`path` 保存路径白名单。它不是用户态指针，而是内核态缓冲区。原因是用户态传入的地址只在用户页表中有效，内核不能直接长期保存并解引用用户指针。将字符串复制到内核的 `struct proc` 中后，进程在后续系统调用和 `exec()` 之后仍能保留这份状态。
+
+### 7. 实现 `sys_interpose()`
+
+在 `kernel/sysproc.c` 中增加：
+
+```C
+uint64
+sys_interpose(void)
+{
+  uint64 mask;
+  argaddr(0, &mask);
+  struct proc *p = myproc();
+  if (argstr(1, p->path, MAXPATH) < 0)
+    return -1;
+  p->interpose_mask = mask;
+  return 0;
+}
+```
+
+原理可以从三个方面理解：
+
+1. `argaddr(0, &mask)` 读取系统调用第 0 个参数，也就是 `a0`。在用户态调用中是 `mask`。
+2. `argstr(1, p->path, MAXPATH)` 读取第 1 个参数，也就是 `a1` 中的用户虚拟地址，并通过 `fetchstr` 和 `copyinstr` 安全地把字符串复制到内核缓冲区。
+3. 只有路径复制成功后，才写入 `p->interpose_mask`。如果路径非法，函数返回 `-1`，掩码保持不变。
+
+`sys_interpose()` 的返回值最终由 `syscall()` 写回 `trapframe->a0`。因此用户态能够通过：
+
+```C
+if (interpose(...) < 0)
+```
+
+判断这个系统调用是否失败。
+
+### 8. 把新系统调用接入分发表
+
+在 `kernel/syscall.c` 中声明处理函数：
+
+```C
+extern uint64 sys_interpose(void);
+```
+
+并把编号映射到函数：
+
+```C
+[SYS_interpose] sys_interpose,
+```
+
+这样 `syscall()` 通过 `trapframe->a7` 取出 `SYS_interpose` 后，才能正确找到 `sys_interpose()`。
+
+### 9. 在系统调用入口检查掩码
+
+在 `kernel/syscall.c:syscall()` 中，读取系统调用号之后增加：
+
+```C
+num = p->trapframe->a7;
+
+if (p->interpose_mask & (1 << num)) {
+  p->trapframe->a0 = -1;
+  return;
+}
+```
+
+判断过程如下：
+
+1. `1 << num` 生成只包含系统调用号 `num` 对应位的掩码。
+2. 与 `p->interpose_mask` 做按位与。
+3. 结果非 0 表示该位被设置，需要拦截。
+4. 不调用真正的系统调用处理函数，直接把 `trapframe->a0` 设置为 `-1`。
+5. `return` 回到 `usertrap()`，最后通过 `userret` 返回用户态。
+
+例如 `SYS_open` 为 15，当掩码为 `32768` 时：
+
+```text
+32768 = 0x00008000
+1 << 15 = 0x00008000
+32768 & (1 << 15) != 0
+```
+
+所以 `open` 被拒绝。
+
+系统调用编号只允许在合法范围内参与位运算。当前实现先执行 `1 << num`，再检查编号是否在 `syscalls` 数组范围内。正常用户程序只会使用 `usys.S` 生成的合法编号，但从安全边界上看，更健壮的实现应先验证 `num` 的范围，再计算掩码。
+
+### 10. 让子进程继承限制
+
+如果父进程已经处于沙箱中，它调用 `fork()` 创建的子进程也必须继续受到相同限制，否则进程只要 `fork()` 一次就可以绕过沙箱。
+
+因此在 `kernel/proc.c:kfork()` 中增加：
+
+```C
+// copy the mask from the parent to the child process.
+np->interpose_mask = p->interpose_mask;
+```
+
+`np` 是刚分配的子进程，`p` 是当前父进程。赋值必须位于子进程被设置为 `RUNNABLE` 之前，这样限制在新进程第一次运行前就已经生效。
+
+当前实现只复制了 `interpose_mask`，没有复制 `path`。因此：
+
+* 禁用哪些系统调用的集合会由 `fork()` 继承；
+* 允许路径本身不会由 `fork()` 继承；
+* 如果受沙箱进程再次 `fork()`，子进程仍然会继承掩码，但它的 `path` 不会自动等于父进程的允许路径；
+* 若希望允许路径也传递给后代，应增加 `safestrcpy(np->path, p->path, MAXPATH)`。
+
+现有评分用例主要验证掩码继承和直接执行命令时的路径放行，因此这条边界没有被现有测试单独覆盖。
+
+### 11. 调用流程
+
+完整调用链可以概括为：
+
+```text
+sandbox 32768 - cat README
+  -> sandbox.c 解析 mask 和 command
+  -> fork()
+  -> 子进程 interpose(32768, "-")
+  -> usys.S: li a7, SYS_interpose; ecall
+  -> syscall(): 查表调用 sys_interpose()
+  -> sys_interpose(): 保存 mask/path 到 struct proc
+  -> exec("cat", ...)
+  -> cat 调用 open("README", ...)
+  -> usys.S: li a7, SYS_open; ecall
+  -> syscall()
+  -> 检查 interpose_mask 的第 SYS_open 位
+  -> 位为 1，设置 trapframe->a0 = -1 并直接返回
+  -> cat 收到 -1，打印 cannot open README
+```
+
+### 12. 基础测试的意义
+
+`sandbox_mask` 测试直接检查掩码拒绝：
+
+```Shell
+sandbox 32768 - echo "hello"
+sandbox 32768 - cat README
+sandbox 32768 - grep xv6 README
+sandbox 128 - grep xv6 README
+sandbox 32896 - grep xv6 README
+sandbox 128 - sh < exec.sh
+```
+
+其中：
+
+* `32768` 屏蔽 `SYS_open`；
+* `128` 屏蔽 `SYS_exec`；
+* `32896` 同时屏蔽 `SYS_open` 和 `SYS_exec`。
+
+`sandbox_fork` 则用于验证 `exec.sh` 中间接创建的进程仍然继承禁用掩码。
+
+## Sandbox with allowed pathnames(easy)
+
+### 1. 实验目标
+
+前一个实验会屏蔽整个系统调用。这个实验增加了例外：如果被屏蔽的是 `open` 或 `exec`，并且它们使用的路径与 `interpose` 保存的允许路径完全相同，那么该次调用应被放行。
+
+例如：
+
+```Shell
+sandbox 32768 README grep xv6 README
+```
+
+虽然 `SYS_open` 被屏蔽，但 `grep` 打开的是 `README`，与允许路径一致，因此可以成功执行。
+
+另一个命令：
+
+```Shell
+sandbox 32768 README grep xv6 x
+```
+
+尝试打开 `x`，与允许路径 `README` 不一致，因此输出：
+
+```text
+grep: cannot open x
+```
+
+### 2. 保存允许路径
+
+在 `struct proc` 中增加路径缓冲区：
+
+```C
+char path[MAXPATH]; // Path to the interpose library
+```
+
+在 `sys_interpose()` 中安全地复制用户路径：
+
+```C
+if (argstr(1, p->path, MAXPATH) < 0)
+  return -1;
+```
+
+路径必须放在 `struct proc` 中，不能保存用户态传进来的地址。用户地址仅在当前进程的页表和当前调用期间有意义，而沙箱限制要在后续任意系统调用中持续生效。
+
+### 3. 提取当前系统调用的路径
+
+`syscall()` 中只有 `open` 和 `exec` 的第 0 个参数是路径名。因此增加一个状态标记：
+
+```C
+uint8 a = 0;
+```
+
+`a == 0` 表示当前调用没有被允许路径豁免；`a == 1` 表示路径匹配成功，可以放行。
+
+接着判断系统调用类型并提取路径：
+
+```C
+if (num == SYS_open || num == SYS_exec){
+  char argpath[MAXPATH];
+  if (argstr(0, argpath, MAXPATH) >= 0)
+  {
+    if (strncmp(argpath, p->path, MAXPATH) == 0)
+    {
+      a = 1;
+    }
+  }
+}
+```
+
+这一段包含三个重要机制：
+
+1. `num == SYS_open || num == SYS_exec` 确保只对具有路径语义的两个系统调用做例外判断。
+2. `argstr(0, argpath, MAXPATH)` 从当前系统调用的第 0 个参数，也就是 `a0` 指向的用户地址中复制路径到内核临时缓冲区。
+3. `strncmp(argpath, p->path, MAXPATH) == 0` 比较当前路径和允许路径。`strncmp` 会在任一字符串达到 `\0` 时停止，因此实际语义是 NUL 结尾字符串是否相同。
+
+如果 `argstr` 失败，`a` 仍为 0。后面仍会进入掩码检查，所以非法用户指针不会被意外放行，属于失败关闭策略。
+
+### 4. 把路径豁免加入最终判断
+
+原来的判断是：
+
+```C
+if (p->interpose_mask & (1 << num)) {
+```
+
+现在改成：
+
+```C
+if ((p->interpose_mask & (1 << num)) && a == 0) {
+```
+
+真值表如下：
+
+| 掩码位 | 路径匹配 | `a` | 是否拦截 |
+| --- | --- | --- | --- |
+| 0 | 不适用 | 0 | 否，正常执行 |
+| 1 | 否 | 0 | 是，返回 `-1` |
+| 1 | 是 | 1 | 否，正常执行 |
+
+因此路径例外只可能改变“掩码已经要求拦截”的情况。如果掩码位为 0，系统调用本来就不会被拦截，路径比较也不会带来额外影响。
+
+### 5. 路径比较的语义
+
+当前实现使用完整的字符串精确匹配：
+
+```C
+strncmp(argpath, p->path, MAXPATH) == 0
+```
+
+这意味着：
+
+```text
+README  == README
+README  != ./README
+README  != /README
+README  != README/
+```
+
+当前实现没有进行路径规范化，没有处理 `.`、`..`、重复斜杠或符号链接，也没有把相对路径转换成绝对路径。实验测试使用的是字面路径 `README`，因此可以直接通过字符串比较完成。
+
+如果把该实现用于真实安全边界，必须考虑路径规范化、工作目录变化、硬链接和符号链接等语义，否则攻击者可能使用等价路径绕过白名单。
+
+### 6. `sandbox_path` 测试
+
+评分脚本中的典型命令是：
+
+```Shell
+sandbox 32768 README grep xv6 README
+cat README > x
+sandbox 32768 README grep xv6 x
+sandbox 32768 x grep xv6 x
+sandbox 128 sh sh < exec.sh
+```
+
+测试关注以下行为：
+
+* `open("README")` 与允许路径 `README` 匹配，因此放行；
+* `open("x")` 与允许路径 `README` 不匹配，因此拒绝；
+* `exec("sh")` 与允许路径 `sh` 匹配，因此放行；
+* 后续不匹配路径的 `exec()` 仍然被拒绝。
+
+### 7. 参数顺序和 `argstr(0, ...)`
+
+在 `syscall()` 中，`argstr(0, argpath, MAXPATH)` 的 `0` 表示系统调用的第 0 个参数，也就是 RISC-V `a0`，不是文件描述符 `0`，也不是进程的当前工作目录。
+
+不同系统调用的第 0 个参数含义不同：
+
+```C
+open(path, flags)     // 参数 0 是 path
+exec(path, argv)      // 参数 0 是 path
+write(fd, buf, n)     // 参数 0 是 fd
+```
+
+所以只有在 `num == SYS_open || num == SYS_exec` 时，才会执行：
+
+```C
+argstr(0, argpath, MAXPATH);
+```
+
+对于 `write` 这类系统调用，不能把 `a0` 当作路径字符串读取。
+
+### 8. 完整路径放行流程
+
+以 `sandbox 32768 README grep xv6 README` 为例：
+
+```text
+用户态 sandbox
+  -> fork()
+  -> 子进程 interpose(32768, "README")
+  -> sys_interpose()
+       -> argaddr(0) 取 mask
+       -> argstr(1) 复制 "README" 到 p->path
+       -> p->interpose_mask = 32768
+  -> exec("grep", ["grep", "xv6", "README"])
+  -> grep 调用 open("README", O_RDONLY)
+  -> syscall()
+       -> num = SYS_open
+       -> argstr(0) 得到 "README"
+       -> strncmp("README", p->path, MAXPATH) == 0
+       -> a = 1
+       -> mask 位为 1，但 a 为 1
+       -> 不拦截，调用 sys_open()
+  -> open 成功，grep 读取 README
+```
+
+如果是 `open("x")`，比较失败，`a` 保持为 0，最终由掩码检查拦截，并将 `-1` 返回给用户态。
+
+### 9. 当前实现的边界
+
+当前版本已经通过以下专项测试：
+
+```Shell
+./grade-lab-syscall sandbox_mask sandbox_fork sandbox_path sandbox_most sandbox_minus
+```
+
+但实现中仍有几个值得记录的边界：
+
+1. `kfork()` 只继承 `interpose_mask`，没有继承 `path`。
+2. 路径匹配是字面字符串匹配，没有做路径规范化。
+3. 只有 `open` 和 `exec` 支持路径白名单，其余被屏蔽的系统调用没有参数级例外。
+4. 掩码检查发生在系统调用号边界检查之前，极端非法的 `a7` 值不应参与未验证的移位运算。
+5. `freeproc()` 没有显式清空 `interpose_mask` 和 `path`。在当前的 `fork()` 流程中，掩码会被覆盖，路径通常也会在调用 `interpose()` 时覆盖，但更严格的实现应在进程分配或释放时把这些字段清零。
+
+这些边界不影响当前实验用例，但如果把 Sandbox 扩展到更真实的安全策略，需要在设计阶段一并处理。
